@@ -182,30 +182,125 @@ test('a file made after the session started can be a blind spot', async ($, on) 
   expect(await ui.find({ text: /src\/ui\/Banner\.tsx:2/ })).toBeDefined()
 })
 
-test('the toast counts the blind spots the band kept; a long line is clipped', async ($, on) => {
+test("each turn's edits replace the band: the toast counts what's new, and a long line is clipped", async ($, on) => {
   const rec = recorder()
-  // pool.ts's connect has twelve users, each on a long line.
+  // pool.ts's connect has twelve users, each on a long line; notes.ts nothing anyone uses.
   const users = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`src/u/U${i}.ts`, `export const u${i} = ${'1 + '.repeat(100)}connect(${i})\n`]))
-  const contents = { ...CONTENTS, 'src/db/pool.ts': 'export function connect(url) {\n  return url\n}\n', ...users }
+  const contents = { ...CONTENTS, 'src/db/pool.ts': 'export function connect(url) {\n  return url\n}\n', 'src/notes.ts': 'const x = 1\n', ...users }
   const connectDiff = '@@ -2 +2 @@\n-  return null\n+  return url'
-  fakeEngine(
-    on,
-    { ...REPO, files: Object.keys(contents), contents, git: args => (args.startsWith('diff') ? (args.endsWith('pool.ts') ? connectDiff : DIFF) : args.startsWith('grep') ? grep(contents, args) : null) },
-    rec,
-  )
+  const diffOf = (args: string) => (args.endsWith('pool.ts') ? connectDiff : args.endsWith('notes.ts') ? '@@ -1 +1 @@\n-const x = 0\n+const x = 1' : DIFF)
+  fakeEngine(on, { ...REPO, files: Object.keys(contents), contents, git: args => (args.startsWith('diff') ? diffOf(args) : args.startsWith('grep') ? grep(contents, args) : null) }, rec)
   await startSession($, ROOT)
   await $.tool.call(EDIT)
   await endTurn($)
   await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/src/db/pool.ts`, old_string: 'null', new_string: 'url' })
   await endTurn($)
-  // Two open, then room for eight of connect's ten.
-  expect(rec.toasts).toEqual(['2 files use what Claude changed but never read', '8 files use what Claude changed but never read'])
+  // sign's two gave way to connect's ten: the newest change wins the band.
+  expect(rec.toasts).toEqual(['2 files use what Claude changed but never read', '10 files use what Claude changed but never read'])
 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /src\/api\/session\.ts/ })).toBeUndefined()
   await ui.press({ key: 'ask' })
-  const lines = (rec.submitted[0] ?? '').split('\n').filter(line => line.startsWith('- src/u/'))
-  expect(lines).toHaveLength(8)
-  expect(lines.every(line => line.length < 220 && line.includes('…'))).toBe(true)
+  const lines = (rec.submitted[0] ?? '').split('\n').filter(line => line.startsWith('- '))
+  expect(lines).toHaveLength(10)
+  expect(lines.every(line => line.startsWith('- src/u/') && line.length < 220 && line.includes('…'))).toBe(true)
+
+  // A turn whose edits nothing else uses clears the band.
+  await $.tool.call(EDIT)
+  await endTurn($)
+  expect(await ui.find({ text: /BLIND SPOT/ })).toBeDefined()
+  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/src/notes.ts`, old_string: '0', new_string: '1' })
+  await endTurn($)
+  expect(await ui.find({ text: /BLIND SPOT/ })).toBeUndefined()
+  expect(rec.statuses.at(-1)).toBeUndefined()
+})
+
+test('a turn without edits drops the blind spots of a change that was reverted', async ($, on) => {
+  const rec = recorder()
+  let diff = DIFF
+  fakeEngine(on, { ...REPO, git: args => (args.startsWith('diff') ? diff : REPO.git(args)) }, rec)
+  await startSession($, ROOT)
+  await $.tool.call(EDIT)
+  await endTurn($)
+  expect(rec.statuses.at(-1)).toBe('2 blind spots')
+
+  // Still changed: a turn of talk keeps them.
+  await endTurn($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /src\/api\/session\.ts:3/ })).toBeDefined()
+
+  diff = ''
+  await endTurn($)
+  expect(await ui.find({ text: /BLIND SPOT/ })).toBeUndefined()
+  expect(rec.statuses.at(-1)).toBeUndefined()
+})
+
+test('a turn without edits follows a use that moved, and drops one that was removed', async ($, on) => {
+  const contents = { ...CONTENTS }
+  fakeEngine(on, { ...REPO, contents })
+  await startSession($, ROOT)
+  await $.tool.call(EDIT)
+  await endTurn($)
+
+  // Someone adds a line above the call in session.ts, and takes sign out of Login.tsx.
+  contents['src/api/session.ts'] = `// auth\n${CONTENTS['src/api/session.ts']}`
+  contents['src/ui/Login.tsx'] = 'export const Login = () => <b>me</b>\n'
+  await endTurn($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /src\/api\/session\.ts:4/ })).toBeDefined()
+  expect(await ui.find({ text: /Login\.tsx/ })).toBeUndefined()
+})
+
+test('a function that changed only through what it calls keeps its blind spots while that change stands', async ($, on) => {
+  // token.ts's private `ttl` changed; only `sign`, in the same file, calls it.
+  const contents = { ...CONTENTS, 'src/auth/token.ts': 'function ttlOf(s) {\n  return s * 2\n}\nexport function sign(userId, ttlSeconds = 900) {\n  return { userId, ttl: ttlOf(ttlSeconds) }\n}\n' }
+  const diff = '@@ -2 +2 @@\n-  return s\n+  return s * 2'
+  fakeEngine(on, { ...REPO, contents, git: args => (args.startsWith('diff') ? diff : args.startsWith('grep') ? grep(contents, args) : null) })
+  await startSession($, ROOT)
+  await $.tool.call(EDIT)
+  await endTurn($)
+  await endTurn($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /src\/api\/session\.ts:3/ })).toBeDefined()
+})
+
+test('after a compaction, what Claude read before counts as unread; the map keeps it', async ($, on) => {
+  const summary = [{ role: 'user' as const, text: 'The summary.', toolUses: [] }]
+  fakeEngine(on, REPO)
+  on('session.compact', () => ({ messages: summary }))
+  await startSession($, ROOT)
+  await $.tool.call({ tool: 'Read', file_path: `${ROOT}/src/api/session.ts` })
+  await $.tool.call(EDIT)
+  await endTurn($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /src\/api\/session\.ts/ })).toBeUndefined()
+
+  // Neither one computed ahead of time nor a subagent's own forgets anything.
+  await $.session.compact({ trigger: 'precompute', messages: summary })
+  await $.session.compact({ trigger: 'auto', messages: summary, agentId: 'agent-1' })
+  await $.tool.call(EDIT)
+  await endTurn($)
+  expect(await ui.find({ text: /src\/api\/session\.ts/ })).toBeUndefined()
+
+  await $.session.compact({ trigger: 'auto', messages: summary })
+  await $.tool.call(EDIT)
+  await endTurn($)
+  expect(await ui.find({ text: /src\/api\/session\.ts:3/ })).toBeDefined()
+  expect((await command($, 'status')).text).toContain('1 read')
+})
+
+test('a /clear starts a new map', async ($, on) => {
+  const rec = recorder()
+  fakeEngine(on, REPO, rec)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  await startSession($, ROOT)
+  await $.tool.call(EDIT)
+  await endTurn($)
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: /BLIND SPOT/ })).toBeUndefined()
+  expect(rec.statuses.at(-1)).toBeUndefined()
+  expect((await command($, 'status')).text).toContain('0 edited')
 })
 
 test('the map pane draws the heatmap in the terminal, and says so elsewhere', async ($, on) => {

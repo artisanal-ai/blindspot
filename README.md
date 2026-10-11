@@ -48,15 +48,28 @@ When the blind-spot band shows:
 | `3` | **Map**: opens the attention map |
 
 The digits work while the prompt is empty. You can also click the buttons, or
-press `ctrl+x` `tab` to focus the band. A blind spot also clears by itself once
-Claude reads the lines of that file that use the function.
+press `ctrl+x` `tab` to focus the band.
+
+The band is about Claude's latest change, so blind spots don't pile up over a
+long session:
+
+- **Claude reads the lines** of the file that use the function: that blind
+  spot clears.
+- **Claude's next turn edits code**: its blind spots take the band's place,
+  and older ones go. `/blindspot scan` brings back every one still open.
+- **A turn with no edits**: each blind spot is checked again. It goes if the
+  change was undone, or the file no longer uses the function. If the line
+  moved, the band follows it.
+- **The conversation is compacted**: Claude keeps only a summary, so what it
+  read before counts as unread from now on. The map still shows it.
+- **`/clear`**: a new conversation starts a new map.
 
 ### Commands
 
 | Command | Does |
 | --- | --- |
 | `/blindspot` | Opens the attention map |
-| `/blindspot scan` | Looks for blind spots now, across every file edited this session |
+| `/blindspot scan` | Looks for blind spots now, across every file edited this session, in place of the band's |
 | `/blindspot status` | Counts: files edited, read, seen; open blind spots |
 | `/blindspot reset` | Clears the map |
 | `/blindspot off` | Stops the blind-spot scans and hides the band and status line (the map keeps drawing) |

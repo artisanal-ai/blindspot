@@ -5,7 +5,7 @@ import type { BlindSpot, Touch } from '../types'
 import type { Read } from './activity'
 import { covers, effectOf, spanOf } from './activity'
 import type { Tools } from './blindspots'
-import { findBlindSpots } from './blindspots'
+import { findBlindSpots, recheck } from './blindspots'
 import { buildGrid, heatOf, LEVELS, levelOf, runsOf } from './heatmap'
 import type { Git, Repo } from './repo'
 import { readRepo, resolve } from './repo'
@@ -25,6 +25,8 @@ const PANE_CHROME_ROWS = 16 // the pane's rows that aren't the heatmap
 const MAP_FILES = 20_000 // enough for any repo a person works in; past this the map would be noise
 const GIT_TIMEOUT_MS = 15_000
 const LSP_TIMEOUT_MS = 5_000
+// A file Claude edited counts as read, every line of it.
+const WHOLE_FILE: [number, number] = [1, Number.MAX_SAFE_INTEGER]
 
 // Session state, held by Claude Code so it survives a reload.
 const touches = atom({ plugin: 'blindspot', key: 'touches' } as const, {})
@@ -171,9 +173,9 @@ async function prepare($: EngineInterface, e: ToolCallInput): Promise<{ dir: str
   return { dir }
 }
 
-// After a tool ran: count what it touched on the map. A file Claude edited,
-// or read every line of that uses a changed function, is no blind spot any
-// more; an edited one waits for the turn's scan.
+// After a tool ran: count what it touched on the map. A file Claude edited
+// counts as read; one whose lines that use a changed function it has all read
+// is no blind spot any more. An edited one waits for the turn's scan.
 async function recordRun($: EngineInterface, e: ToolCallInput, output: string, dir: string | null) {
   const r = await repoOf($)
   if (r === null) return
@@ -195,32 +197,61 @@ async function recordRun($: EngineInterface, e: ToolCallInput, output: string, d
     return text === null ? null : text.replace(/\n$/, '').split('\n').length
   }
   const spans = await Promise.all(reads.map(async read => [read.path, spanOf(read, await lengthOf(read))] as const))
+  const wholes = edited.map(path => [path, [WHOLE_FILE]] as [string, [number, number][]])
 
   await update($, touches, all => withTouches(withTouches(withTouches(all, seen, 'seen'), [...new Set(reads.map(read => read.path))], 'read'), edited, 'edit'))
-  const lines = await update($, readLines, all => withSpans(all, spans))
-  const isLooked = (spot: BlindSpot) => edited.includes(spot.path) || (spot.lines ?? [spot.line]).every(line => covers(lines[spot.path] ?? [], line))
+  const lines = await update($, readLines, all => withSpans(all, [...spans, ...wholes]))
+  const isLooked = (spot: BlindSpot) => (spot.lines ?? [spot.line]).every(line => covers(lines[spot.path] ?? [], line))
   await update($, blindSpots, list => list.filter(spot => !isLooked(spot)))
   if (edited.length > 0) await update($, pending, list => [...new Set([...list, ...edited])])
   await refreshStatus($)
 }
 
-// The blind spots of `changed` since `base`, added to the band. Returns how many are new.
+// Whether Claude has read a line of a file, by what it remembers.
+async function readerOf($: EngineInterface): Promise<(path: string, line: number) => boolean> {
+  const lines = await read($, readLines)
+  return (path, line) => covers(lines[path] ?? [], line)
+}
+
+// The blind spots of `changed` since `base`, in place of those open: the band
+// is about the latest change, and spots left from earlier ones Claude has
+// moved on from. Returns how many weren't open before.
 async function scan($: EngineInterface, changed: string[], base: string | null): Promise<number> {
   const r = await repoOf($)
   if (r === null || changed.length === 0) return 0
-  const all = await read($, touches)
-  const lines = await read($, readLines)
-  const isRead = (path: string, line: number) => (all[path]?.edit ?? 0) > 0 || covers(lines[path] ?? [], line)
   // '' is a repo with no commit yet: the change is diffed against the index.
-  const found = await findBlindSpots(toolsFor($, r), r, changed, base || null, isRead, MAX_BLIND_SPOTS)
+  const found = await findBlindSpots(toolsFor($, r), r, changed, base || null, await readerOf($), MAX_BLIND_SPOTS)
   let added = 0
   await update($, blindSpots, open => {
-    const next = [...open, ...found.filter(spot => !open.some(o => o.path === spot.path))].slice(0, MAX_BLIND_SPOTS)
-    added = Math.max(0, next.length - open.length)
-    return next
+    added = found.filter(spot => !open.some(o => o.path === spot.path)).length
+    return found
   })
   await refreshStatus($)
   return added
+}
+
+// The open blind spots that still hold after a turn that changed no code:
+// those whose change was reverted, or whose use someone else fixed, go.
+async function recheckOpen($: EngineInterface) {
+  const r = await repoOf($)
+  const open = await read($, blindSpots)
+  const base = (await read($, bases)).session
+  if (r === null || open.length === 0 || base === null) return
+  const kept = await recheck(toolsFor($, r), open, base || null, await readerOf($))
+  // Each rechecked spot as it is now; one dismissed or read meanwhile stays gone.
+  const isRechecked = (spot: BlindSpot) => open.some(o => o.path === spot.path)
+  await update($, blindSpots, list => list.flatMap(spot => (isRechecked(spot) ? kept.filter(k => k.path === spot.path) : [spot])))
+  await refreshStatus($)
+}
+
+// Everything blindspot knows of the session, forgotten.
+async function clearAll($: EngineInterface) {
+  await update($, touches, () => ({}))
+  await update($, readLines, () => ({}))
+  await update($, blindSpots, () => [])
+  await update($, pending, () => [])
+  await update($, bases, () => ({ session: null, turn: null }))
+  await refreshStatus($)
 }
 
 // --- /blindspot ---
@@ -242,12 +273,7 @@ async function command($: EngineInterface, arg: string): Promise<string> {
     return arg === 'off' ? 'blindspot paused: no blind-spot scans. /blindspot on to resume.' : 'blindspot on.'
   }
   if (arg === 'reset') {
-    await update($, touches, () => ({}))
-    await update($, readLines, () => ({}))
-    await update($, blindSpots, () => [])
-    await update($, pending, () => [])
-    await update($, bases, () => ({ session: null, turn: null }))
-    await refreshStatus($)
+    await clearAll($)
     return 'blindspot: map cleared.'
   }
   if (arg === 'scan') {
@@ -401,10 +427,28 @@ export const register: Register = (on, options) => {
       return { ...b, turn: null }
     })
     await refreshRepo($)
-    if (changed.length === 0 || (await read($, isPaused))) return result
+    if (await read($, isPaused)) return result
+    if (changed.length === 0) {
+      await recheckOpen($).catch(() => {})
+      return result
+    }
     const added = await scan($, changed, base).catch(() => 0)
     if (added > 0) $.ui.toast(`${plural(added, 'file')} ${added === 1 ? 'uses' : 'use'} what Claude changed but never read`)
     return result
+  })
+
+  // A compacted conversation keeps a summary, not the files Claude read: what
+  // it read before counts as unread from now on. The map keeps it all.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (result.skip === undefined && e.agentId === undefined && e.trigger !== 'precompute') await update($, readLines, () => ({}))
+    return result
+  })
+
+  // A /clear starts a new conversation, so a new map.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') await clearAll($).catch(() => {})
+    return next(e)
   })
 
   on('command.run', { command: 'blindspot' }, async ($, e) => ({ text: await command($, e.args.trim()) }))

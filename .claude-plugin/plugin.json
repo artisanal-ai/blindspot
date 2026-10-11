@@ -1,6 +1,6 @@
 {
   "name": "blindspot",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "See where Claude looked, and what it didn't: a live heatmap of the files Claude searched, read and edited, and a warning for the files that use what it changed but it never read.",
   "author": {
     "name": "Artisanal AI"

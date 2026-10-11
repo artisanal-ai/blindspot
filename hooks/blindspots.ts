@@ -238,11 +238,12 @@ export async function findBlindSpots(
     const content = diff === null || diff === '' ? null : await tools.readFile(path)
     if (diff === null || content === null) continue
     const lines = content.split('\n')
-    const queue = changedDeclarations(path, diff, content)
+    // Each declaration with the changed one it stands for.
+    const queue = changedDeclarations(path, diff, content).map(decl => ({ decl, origin: decl.name }))
     const asked = new Set<string>()
 
     while (queue.length > 0 && asked.size < MAX_DECLARATIONS && (await tools.now()) < deadline) {
-      const decl = queue.shift() as Declaration
+      const { decl, origin } = queue.shift() as { decl: Declaration; origin: string }
       if (asked.has(decl.name)) continue
       asked.add(decl.name)
       const places = await usesOf(tools, repo, decl, retry)
@@ -251,7 +252,7 @@ export async function findBlindSpots(
         // Only used in its own file: what calls it there changed too.
         for (const p of places.filter(p => p.line !== decl.line)) {
           const caller = enclosing(lines, p.line)
-          if (caller !== null && caller.line !== decl.line) queue.push({ path, ...caller })
+          if (caller !== null && caller.line !== decl.line) queue.push({ decl: { path, ...caller }, origin })
         }
         continue
       }
@@ -262,10 +263,55 @@ export async function findBlindSpots(
         const text = ((await tools.readFile(file)) ?? '').split('\n')
         const uses = unread.map(p => ({ line: p.line, usage: clip(text[p.line - 1]?.trim() ?? '') }))
         const best = uses.find(use => !IMPORT_LINE.test(use.usage)) ?? uses[0]
-        if (best !== undefined) spots.set(file, { path: file, changedFile: path, symbol: decl.name, ...best, lines: uses.map(use => use.line) })
+        if (best !== undefined) spots.set(file, { path: file, changedFile: path, symbol: decl.name, changedSymbol: origin, ...best, lines: uses.map(use => use.line) })
       }
     }
   }
   const rank = (spot: BlindSpot) => (TEST.test(spot.path) ? 1 : 0)
   return [...spots.values()].sort((a, b) => rank(a) - rank(b)).slice(0, limit)
+}
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * The blind spots in `spots` that still hold, rechecked after a turn that left
+ * them open: the change each traces back to is still in its file since `base`
+ * (a commit; null for the index), and the file still uses the function on a
+ * line Claude hasn't read, its line numbers as the file is now. A spot dropped
+ * here was reverted, or fixed or moved by someone else. One git can't answer
+ * for stays as it was.
+ */
+export async function recheck(tools: Tools, spots: BlindSpot[], base: string | null, isRead: (path: string, line: number) => boolean): Promise<BlindSpot[]> {
+  // The names each changed file's diff still touches; null when git failed.
+  const touched = new Map<string, Set<string> | null>()
+  const namesChangedIn = async (path: string) => {
+    if (!touched.has(path)) {
+      const diff = await tools.git(['diff', '-U0', '--no-color', ...(base === null ? [] : [base]), '--', path])
+      // A deleted file reads as empty: its declarations are all gone.
+      const content = diff === null ? '' : ((await tools.readFile(path)) ?? '')
+      touched.set(path, diff === null ? null : new Set(changedDeclarations(path, diff, content).map(decl => decl.name)))
+    }
+    return touched.get(path) ?? null
+  }
+
+  const kept: BlindSpot[] = []
+  for (const spot of spots) {
+    const names = await namesChangedIn(spot.changedFile)
+    if (names === null) {
+      kept.push(spot)
+      continue
+    }
+    if (!names.has(spot.changedSymbol ?? spot.symbol)) continue
+    const text = await tools.readFile(spot.path)
+    if (text === null) continue
+    const word = new RegExp(`(?<![\\w$])${escapeRegExp(spot.symbol)}(?![\\w$])`)
+    const uses = text
+      .split('\n')
+      .map((line, i) => ({ line: i + 1, text: line }))
+      .filter(use => word.test(use.text) && !COMMENT.test(use.text) && declarationIn(use.text)?.name !== spot.symbol && !isRead(spot.path, use.line))
+      .map(use => ({ line: use.line, usage: clip(use.text.trim()) }))
+    const best = uses.find(use => !IMPORT_LINE.test(use.usage)) ?? uses[0]
+    if (best !== undefined) kept.push({ ...spot, ...best, lines: uses.map(use => use.line) })
+  }
+  return kept
 }
