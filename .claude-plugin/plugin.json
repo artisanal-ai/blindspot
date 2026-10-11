@@ -1,0 +1,18 @@
+{
+  "name": "blindspot",
+  "version": "0.2.1",
+  "description": "See where Claude looked, and what it didn't: a live heatmap of the files Claude searched, read and edited, and a warning for the files that use what it changed but it never read.",
+  "author": {
+    "name": "Artisanal AI"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpenPane": {
+      "type": "boolean",
+      "title": "Open the map at start",
+      "description": "Open the attention map beside the transcript when the session starts (wide fullscreen terminals only).",
+      "default": true
+    }
+  }
+}

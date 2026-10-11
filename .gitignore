@@ -1,0 +1,6 @@
+.DS_Store
+# Written by Claude Code when it loads the plugin
+.claude-plugin/types/
+tsconfig.json
+# Demo videos and GIFs, kept on disk only
+docs/
